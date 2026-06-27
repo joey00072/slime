@@ -1,23 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Reproduce the DAPO 8k RL-vs-OPD systems experiment on an H100 node.
+# Reproduce the DAPO 8k RL-vs-OPD systems experiment on a 2xH200 node.
 #
-# Default layout targets 8xH100-80GB:
-#   Ray/student: GPUs 0,1 for Megatron actor training and GPUs 2,3,4,5 for SGLang rollout.
-#   Teacher:     GPUs 6,7 with SGLang tensor parallel size 2.
+# Default layout:
+#   GPU 0: Megatron actor training colocated with student SGLang rollout.
+#   GPU 1: Qwen3-8B SGLang teacher for OPD.
 #
 # Usage:
-#   bash examples/on_policy_distillation/run-qwen3-1.7B-dapo-h100-deepscaler-opd.sh rl
-#   bash examples/on_policy_distillation/run-qwen3-1.7B-dapo-h100-deepscaler-opd.sh opd
-#
-# Important env overrides:
-#   RAY_VISIBLE_DEVICES=0,1,2,3,4,5
-#   TEACHER_VISIBLE_DEVICES=6,7
-#   ACTOR_GPUS=2
-#   ROLLOUT_GPUS=4
-#   TEACHER_TP=2
-#   NUM_ROLLOUT=30
+#   bash examples/on_policy_distillation/run-qwen3-1.7B-dapo-h200-deepscaler-opd.sh rl
+#   bash examples/on_policy_distillation/run-qwen3-1.7B-dapo-h200-deepscaler-opd.sh opd
 
 MODE="${1:-rl}"
 if [[ "$MODE" != "rl" && "$MODE" != "opd" ]]; then
@@ -28,30 +20,22 @@ fi
 export PYTHONUNBUFFERED=1
 export HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-0}"
 export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
-
-export RAY_VISIBLE_DEVICES="${RAY_VISIBLE_DEVICES:-0,1,2,3,4,5}"
-export TEACHER_VISIBLE_DEVICES="${TEACHER_VISIBLE_DEVICES:-6,7}"
-export RAY_NUM_GPUS="${RAY_NUM_GPUS:-6}"
-export ACTOR_GPUS="${ACTOR_GPUS:-2}"
-export ROLLOUT_GPUS="${ROLLOUT_GPUS:-4}"
-export ROLLOUT_GPUS_PER_ENGINE="${ROLLOUT_GPUS_PER_ENGINE:-1}"
-export TEACHER_TP="${TEACHER_TP:-2}"
 export TEACHER_PORT="${TEACHER_PORT:-13141}"
 
 export STUDENT_MODEL_DIR="${STUDENT_MODEL_DIR:-/root/models/Qwen3-1.7B}"
 export TEACHER_MODEL_DIR="${TEACHER_MODEL_DIR:-/root/models/Qwen3-8B}"
 export STUDENT_DIST_DIR="${STUDENT_DIST_DIR:-/root/models/Qwen3-1.7B_torch_dist}"
 export DATA_DIR="${DATA_DIR:-/root/datasets/dapo-math-17k}"
-export RUN_ROOT="${RUN_ROOT:-/root/slime-runs/qwen3-1.7b-dapo-h100-${MODE}}"
+export RUN_ROOT="${RUN_ROOT:-/root/slime-runs/qwen3-1.7b-dapo-h200-${MODE}}"
 
 export NUM_ROLLOUT="${NUM_ROLLOUT:-30}"
 export ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-32}"
 export N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-8}"
 export GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-256}"
 export ROLLOUT_MAX_RESPONSE_LEN="${ROLLOUT_MAX_RESPONSE_LEN:-8192}"
-export MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-8192}"
-export STUDENT_SGLANG_MEM_FRACTION="${STUDENT_SGLANG_MEM_FRACTION:-0.70}"
-export TEACHER_SGLANG_MEM_FRACTION="${TEACHER_SGLANG_MEM_FRACTION:-0.70}"
+export MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-16384}"
+export STUDENT_SGLANG_MEM_FRACTION="${STUDENT_SGLANG_MEM_FRACTION:-0.50}"
+export TEACHER_SGLANG_MEM_FRACTION="${TEACHER_SGLANG_MEM_FRACTION:-0.60}"
 
 mkdir -p /root/models /root/datasets "$RUN_ROOT"
 cd /root/slime
@@ -62,6 +46,9 @@ pip install -e . --no-deps >/tmp/slime_editable_install.log 2>&1 || {
 }
 
 cleanup() {
+  if [[ -n "${TEACHER_PID:-}" ]]; then
+    kill "$TEACHER_PID" 2>/dev/null || true
+  fi
   pkill -9 sglang 2>/dev/null || true
   ray stop --force 2>/dev/null || true
   pkill -9 ray 2>/dev/null || true
@@ -94,12 +81,12 @@ fi
 TEACHER_PID=""
 if [[ "$MODE" == "opd" ]]; then
   TEACHER_LOG="$RUN_ROOT/teacher_sglang.log"
-  echo "Starting Qwen3-8B OPD teacher on CUDA_VISIBLE_DEVICES=${TEACHER_VISIBLE_DEVICES}"
-  CUDA_VISIBLE_DEVICES="$TEACHER_VISIBLE_DEVICES" python3 -m sglang.launch_server \
+  echo "Starting Qwen3-8B OPD teacher on GPU 1"
+  CUDA_VISIBLE_DEVICES=1 python3 -m sglang.launch_server \
     --model-path "$TEACHER_MODEL_DIR" \
     --host 0.0.0.0 \
     --port "$TEACHER_PORT" \
-    --tp "$TEACHER_TP" \
+    --tp 1 \
     --chunked-prefill-size 4096 \
     --mem-fraction-static "$TEACHER_SGLANG_MEM_FRACTION" \
     > "$TEACHER_LOG" 2>&1 &
@@ -201,7 +188,7 @@ PERF_ARGS=(
 )
 
 SGLANG_ARGS=(
-  --rollout-num-gpus-per-engine "$ROLLOUT_GPUS_PER_ENGINE"
+  --rollout-num-gpus-per-engine 1
   --sglang-mem-fraction-static "$STUDENT_SGLANG_MEM_FRACTION"
   --sglang-cuda-graph-max-bs 32
   --sglang-enable-metrics
@@ -213,19 +200,16 @@ MISC_ARGS=(
   --accumulate-allreduce-grads-in-fp32
   --attention-softmax-in-fp32
   --attention-backend flash
+  --actor-num-nodes 1
+  --actor-num-gpus-per-node 1
+  --num-gpus-per-node 1
+  --colocate
 )
 
-NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l | tr -d ' ')
-if [[ "${NVLINK_COUNT:-0}" -gt 0 ]]; then
-  HAS_NVLINK=1
-else
-  HAS_NVLINK=0
-fi
-
-echo "Starting Ray on CUDA_VISIBLE_DEVICES=${RAY_VISIBLE_DEVICES} with ${RAY_NUM_GPUS} logical GPUs"
-CUDA_VISIBLE_DEVICES="$RAY_VISIBLE_DEVICES" ray start --head \
+export CUDA_VISIBLE_DEVICES=0
+ray start --head \
   --node-ip-address "$MASTER_ADDR" \
-  --num-gpus "$RAY_NUM_GPUS" \
+  --num-gpus 1 \
   --disable-usage-stats \
   --dashboard-host=0.0.0.0 \
   --dashboard-port=8265
@@ -234,12 +218,13 @@ RUNTIME_ENV_JSON="{
   \"env_vars\": {
     \"PYTHONPATH\": \"/root/Megatron-LM/\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
-    \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\",
+    \"NCCL_NVLS_ENABLE\": \"0\",
+    \"RAY_USE_UVLOOP\": \"0\",
     \"MASTER_ADDR\": \"${MASTER_ADDR}\"
   }
 }"
 
-CUDA_VISIBLE_DEVICES="$RAY_VISIBLE_DEVICES" ray job submit --address="http://127.0.0.1:8265" \
+ray job submit --address="http://127.0.0.1:8265" \
   --runtime-env-json="$RUNTIME_ENV_JSON" \
   -- python3 /root/slime/train.py \
   "${MODEL_ARGS[@]}" \
@@ -250,7 +235,4 @@ CUDA_VISIBLE_DEVICES="$RAY_VISIBLE_DEVICES" ray job submit --address="http://127
   "${PERF_ARGS[@]}" \
   "${SGLANG_ARGS[@]}" \
   "${MISC_ARGS[@]}" \
-  --actor-num-nodes 1 \
-  --actor-num-gpus-per-node "$ACTOR_GPUS" \
-  --rollout-num-gpus "$ROLLOUT_GPUS" \
   "${RM_ARGS[@]}" 2>&1 | tee "$RUN_ROOT/ray_job.log"

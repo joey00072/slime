@@ -33,9 +33,9 @@ This example shows how to run **on-policy distillation (OPD)** using slime. A sm
   - `post_process_rewards` trims the teacher logprobs to the generated response span and writes the tensors back to each `Sample` to compute advantages.
 - `run-qwen3-8B-opd.sh` launches an SGLang teacher server, then submits a Ray job that runs `train.py`.
 - `run-qwen3-8B-opd-megatron.sh` uses Megatron-loaded teacher model (no external server needed).
-- `run-qwen3-1.7B-dapo-h100-deepscaler-opd.sh` reproduces the 8k DAPO
-  RL-vs-OPD systems experiment on an 8xH100 node. See
-  `README_deepscaler_h100.md` for the exact layout and command lines.
+- `run-qwen3-1.7B-dapo-h200-deepscaler-opd.sh` reproduces the 8k DAPO
+  RL-vs-OPD systems experiment on a 2xH200 node. See
+  `README_deepscaler_h200.md` for the exact layout and command lines.
 
 ## Running the example
 
